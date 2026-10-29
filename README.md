@@ -31,11 +31,26 @@ Esta carpeta corresponde a la tercera y última versión del proyecto, enfocada 
 
 La V3.0 no intenta generalizar todas las aplicaciones ni todas las químicas. Su objetivo es consolidar una versión final sólida y enfocada en el caso EV/LCO, que es el escenario más relevante y fácil de validar científicamente.
 
-## Siguientes pasos
+## Estado actual del algoritmo
 
-1. Definir variables de diseño relevantes para EV/LCO
-2. Reescribir la formulación de objetivos y restricciones
-3. Implementar el pipeline de surrogate
-4. Ejecutar experimentos reproducibles
-5. Validar frente a P2D
-6. Generar resultados y figuras finales
+La primera implementación de IMICA incluye islas, SBX, mutación polinomial,
+dominancia con restricciones, selección de supervivientes mediante energía de
+Riesz y migración en anillo. Su adaptador traduce el objetivo de energía a
+minimización y normaliza las restricciones de voltaje.
+
+Prueba corta:
+
+```powershell
+python -m unittest discover -s tests -v
+python experiments\EV_LCO\scripts\run_imica.py
+```
+
+**Importante:** el evaluador de batería actual sigue siendo un baseline
+provisional y no resuelve las ecuaciones P2D. Sus salidas no son resultados
+científicos ni deben usarse para conclusiones; IMICA debe conectarse al
+simulador P2D o a surrogates validados antes de ejecutar los experimentos
+finales.
+
+Pendiente: validar la formulación física, completar la selección/referencia del
+algoritmo frente a la especificación de V2 y conectar los evaluadores P2D y
+surrogate.
