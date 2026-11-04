@@ -14,7 +14,7 @@ Esta carpeta corresponde a la tercera y última versión del proyecto, enfocada 
 
 - `src/`: implementación principal del algoritmo y del pipeline de optimización
   - `core/`: lógica central del problema y flujo de ejecución
-  - `optimization/`: IMICA, NSGA-III, indicadores y selección
+  - `optimization/`: IMICA, IRBO, NSGA-III, indicadores y selección
   - `surrogate/`: entrenamiento y evaluación del surrogate
   - `utils/`: utilidades generales
 - `experiments/EV_LCO/`: experimentos específicos para EV + LCO
@@ -34,9 +34,11 @@ La V3.0 no intenta generalizar todas las aplicaciones ni todas las químicas. Su
 
 ## Estado actual del algoritmo
 
-La primera implementación de IMICA incluye islas, SBX, mutación polinomial,
-dominancia con restricciones, selección de supervivientes mediante energía de
-Riesz y migración en anillo. Su adaptador traduce el objetivo de energía a
+IMICA mantiene la estructura original de islas con indicadores de calidad por
+isla; su implementación está en `src/optimization/imica.py`. El optimizador
+de benchmark basado en energía de Riesz se denomina Island Riez-Based Optimizer
+(IRBO) y está separado en `src/optimization/irbo.py`. Ambos comparten
+operadores mixtos y el adaptador EV/LCO traduce el objetivo de energía a
 minimización y normaliza las restricciones de voltaje.
 
 Prueba corta:
@@ -44,6 +46,7 @@ Prueba corta:
 ```powershell
 python -m unittest discover -s tests -v
 python experiments\EV_LCO\scripts\run_imica.py
+python experiments\EV_LCO\scripts\run_irbo.py
 ```
 
 **Importante:** el evaluador de batería de `src/core/battery.py` sigue siendo
@@ -56,10 +59,10 @@ referencia definido; no demostrarán la precisión del modelo de batería ni la
 validez de sus predicciones para una celda real. La validación experimental se
 plantea como trabajo futuro.
 
-Pendiente: conectar el evaluador de IMICA al P2D de referencia, restringirlo a
-un dominio numéricamente válido, completar la selección/referencia del
-algoritmo frente a la especificación de V2 y definir el protocolo de
-comparación.
+Pendiente: conectar los evaluadores de IMICA e IRBO al P2D de referencia,
+restringirlo a un dominio numéricamente válido, completar la
+selección/referencia del algoritmo frente a la especificación de V2 y definir
+el protocolo de comparación.
 
 ## Base del simulador P2D
 

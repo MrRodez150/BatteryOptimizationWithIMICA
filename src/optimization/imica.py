@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
+from .indicators import (
+    DeltaP,
+    EpsilonPlus,
+    IGDPlus,
+    QualityIndicator,
+    R2,
+    SMS,
+)
 from .operators import make_offspring, sample_design
 from .problem import Variable
 
@@ -159,6 +167,8 @@ def _survivors(
 
     selected: list[Individual] = []
     for front_indices in _fronts(population):
+        if len(selected) == capacity:
+            break
         front = [population[index] for index in front_indices]
         remaining = capacity - len(selected)
         if len(front) <= remaining:
@@ -176,29 +186,145 @@ def _survivors(
     return selected
 
 
-class IMICA:
-    """Island-based multi-objective evolutionary optimizer.
+def _reference_objectives(reference: list[Individual]) -> np.ndarray:
+    if not reference:
+        return np.empty((0, 0), dtype=float)
+    feasible = [individual for individual in reference if individual.feasible]
+    candidates = feasible or reference
+    front = _fronts(candidates)[0]
+    return np.unique(
+        np.vstack([candidates[index].objectives for index in front]), axis=0
+    )
 
-    The implementation uses constraint-aware Pareto sorting, SBX/polynomial
-    mutation, Riesz-energy survivor selection, and periodic ring migration.
+
+def _normalize_indicator_inputs(
+    points: np.ndarray, reference_front: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    combined = np.vstack((points, reference_front))
+    ideal = np.min(combined, axis=0)
+    span = np.ptp(combined, axis=0)
+    span[span == 0.0] = 1.0
+    return (points - ideal) / span, (reference_front - ideal) / span
+
+
+def _indicator_value(
+    indicator: QualityIndicator,
+    points: np.ndarray,
+    reference_front: np.ndarray | None,
+) -> float:
+    value = float(indicator(points, reference_front))
+    if not np.isfinite(value):
+        raise ValueError(
+            f"Indicator {indicator.name!r} returned a non-finite value."
+        )
+    return value
+
+
+def _indicator_survivors(
+    population: list[Individual],
+    capacity: int,
+    indicator: QualityIndicator,
+    reference: list[Individual],
+) -> tuple[list[Individual], float]:
+    reference_front = _reference_objectives(reference)
+    selected: list[Individual] = []
+    split_front: list[Individual] | None = None
+
+    for front_indices in _fronts(population):
+        if len(selected) == capacity:
+            break
+        front = [population[index] for index in front_indices]
+        if len(selected) + len(front) <= capacity:
+            selected.extend(front)
+        else:
+            split_front = front
+            break
+
+    if split_front is not None:
+        remaining = capacity - len(selected)
+        points = np.vstack([individual.objectives for individual in split_front])
+        if reference_front.size == 0:
+            reference_front = points.copy()
+
+        while len(split_front) > remaining:
+            current_points = np.vstack(
+                [individual.objectives for individual in split_front]
+            )
+            normalized_current, normalized_reference = _normalize_indicator_inputs(
+                current_points, reference_front
+            )
+            reference_arg = (
+                normalized_reference
+                if indicator.requires_reference
+                else None
+            )
+            current_value = _indicator_value(
+                indicator, normalized_current, reference_arg
+            )
+            contributions = []
+            for index in range(len(split_front)):
+                reduced = np.delete(normalized_current, index, axis=0)
+                reduced_value = _indicator_value(indicator, reduced, reference_arg)
+                contributions.append(abs(current_value - reduced_value))
+            del split_front[int(np.argmin(contributions))]
+
+        selected.extend(split_front)
+
+    selected_front = _fronts(selected)
+    front_objectives = np.vstack(
+        [selected[index].objectives for index in selected_front[0]]
+    )
+    if reference_front.size == 0:
+        reference_front = front_objectives.copy()
+    normalized_front, normalized_reference = _normalize_indicator_inputs(
+        front_objectives, reference_front
+    )
+    reference_arg = normalized_reference if indicator.requires_reference else None
+    value = _indicator_value(indicator, normalized_front, reference_arg)
+    return selected, value
+
+
+class IMICA:
+    """Indicator-driven island optimizer following the original IMICA design.
+
+    Each island is assigned one quality indicator. Pareto fronts enforce
+    constraint-aware survival, and the island's indicator truncates an
+    overflowing front. NDR references are maintained separately per island.
     """
+
+    _DEFAULT_INDICATORS = (SMS, R2, IGDPlus, EpsilonPlus, DeltaP)
 
     def __init__(
         self,
         problem: Any,
         variables: tuple[Variable, ...] | None = None,
         population_size: int = 40,
-        islands: int = 5,
+        islands: int | None = None,
+        indicators: Sequence[QualityIndicator] | None = None,
         migration_interval: int = 10,
         migrants: int = 2,
         seed: int | None = None,
+        select_mode: str = "Rand",
     ) -> None:
         self.problem = problem
         self.variables = variables or tuple(problem.variables)
+        if indicators is None:
+            island_count = 5 if islands is None else islands
+            self.indicators = tuple(
+                self._DEFAULT_INDICATORS[index % len(self._DEFAULT_INDICATORS)]()
+                for index in range(island_count)
+            )
+        else:
+            self.indicators = tuple(indicators)
+            island_count = len(self.indicators) if islands is None else islands
+            if island_count != len(self.indicators):
+                raise ValueError("Provide exactly one indicator per island.")
+
         self.population_size = population_size
-        self.island_count = islands
+        self.island_count = island_count
         self.migration_interval = migration_interval
         self.migrant_count = migrants
+        self.select_mode = select_mode
         self.rng = np.random.default_rng(seed)
         self.evaluations = 0
         self.archive: list[Individual] = []
@@ -214,6 +340,18 @@ class IMICA:
             raise ValueError("migration_interval must be at least 1.")
         if not 0 <= self.migrant_count < self.population_size:
             raise ValueError("migrants must be in [0, population_size).")
+        if self.select_mode not in {"Rand", "Roulette"}:
+            raise ValueError("select_mode must be 'Rand' or 'Roulette'.")
+        for indicator in self.indicators:
+            if (
+                not callable(indicator)
+                or not getattr(indicator, "name", None)
+                or not isinstance(getattr(indicator, "requires_reference", None), bool)
+            ):
+                raise ValueError(
+                    "Each indicator must be callable, named, and declare "
+                    "whether it requires a reference front."
+                )
 
     def _evaluate(self, design: dict[str, float | int]) -> Individual:
         evaluation = self.problem.evaluate(design)
@@ -228,22 +366,20 @@ class IMICA:
         self.evaluations += 1
         return Individual(design, objectives, constraints, evaluation)
 
-    def _select_parent(
+    def _select_parents(
         self, population: list[Individual], ranks: dict[int, int]
-    ) -> Individual:
-        candidates = self.rng.choice(len(population), size=2, replace=False)
-        first_index, second_index = int(candidates[0]), int(candidates[1])
-        if ranks[first_index] != ranks[second_index]:
-            winner = first_index if ranks[first_index] < ranks[second_index] else second_index
+    ) -> tuple[Individual, Individual]:
+        if self.select_mode == "Rand":
+            indices = self.rng.choice(len(population), size=2, replace=False)
         else:
-            front = [population[first_index], population[second_index]]
-            if _dominates(front[0], front[1]):
-                winner = first_index
-            elif _dominates(front[1], front[0]):
-                winner = second_index
-            else:
-                winner = first_index if self.rng.random() < 0.5 else second_index
-        return population[winner]
+            probabilities = np.asarray(
+                [1.0 / (ranks[index] + 1.0) for index in range(len(population))]
+            )
+            probabilities /= np.sum(probabilities)
+            indices = self.rng.choice(
+                len(population), size=2, replace=False, p=probabilities
+            )
+        return population[int(indices[0])], population[int(indices[1])]
 
     @staticmethod
     def _ranks(population: list[Individual]) -> dict[int, int]:
@@ -257,47 +393,73 @@ class IMICA:
         combined = self.archive + candidates
         if not combined:
             return
-        self.archive = [
-            combined[index]
-            for index in _fronts(combined)[0]
-        ]
+        self.archive = [combined[index] for index in _fronts(combined)[0]]
         if len(self.archive) > self.population_size * self.island_count:
             self.archive = _survivors(
                 self.archive, self.population_size * self.island_count
             )
 
-    def _update_reference(
-        self, island_index: int, candidates: list[Individual]
+    def _record_indicator(
+        self,
+        history: list[dict[str, Any]],
+        generation: int,
+        island_index: int,
+        population: list[Individual],
+        reference: list[Individual],
+        value: float,
     ) -> None:
-        self.references[island_index] = _nondominated_reference(
-            self.references[island_index],
-            candidates,
-            self.population_size,
+        history.append(
+            {
+                "generation": generation,
+                "island": island_index,
+                "indicator": self.indicators[island_index].name,
+                "value": value,
+                "feasible_count": sum(individual.feasible for individual in population),
+                "reference_size": len(reference),
+            }
         )
 
     def _migrate(
         self,
         populations: list[list[Individual]],
-        references: list[list[Individual]],
+        history: list[dict[str, Any]],
+        generation: int,
     ) -> None:
         if self.migrant_count == 0 or self.island_count < 2:
             return
-        migrants = []
-        for population in populations:
-            ranked = _survivors(population, self.population_size)
-            migrants.append(ranked[: self.migrant_count])
+        incoming: list[list[Individual]] = [
+            [] for _ in range(self.island_count)
+        ]
+        for source_index, population in enumerate(populations):
+            for destination_index in range(self.island_count):
+                if source_index == destination_index:
+                    continue
+                migrant_indices = self.rng.choice(
+                    len(population), size=self.migrant_count, replace=False
+                )
+                incoming[destination_index].extend(
+                    population[int(index)] for index in migrant_indices
+                )
 
-        for island_index, population in enumerate(populations):
-            incoming = migrants[(island_index - 1) % self.island_count]
-            references[island_index] = _nondominated_reference(
-                references[island_index],
-                population + incoming,
+        for island_index in range(self.island_count):
+            candidates = populations[island_index] + incoming[island_index]
+            reference = self.references[island_index]
+            populations[island_index], value = _indicator_survivors(
+                candidates,
                 self.population_size,
+                self.indicators[island_index],
+                reference,
             )
-            populations[island_index] = _survivors(
-                population + incoming,
-                self.population_size,
-                references[island_index],
+            self.references[island_index] = _nondominated_reference(
+                reference, populations[island_index], self.population_size
+            )
+            self._record_indicator(
+                history,
+                generation,
+                island_index,
+                populations[island_index],
+                reference,
+                value,
             )
 
     def run(self, max_evaluations: int) -> dict[str, Any]:
@@ -308,7 +470,6 @@ class IMICA:
 
         self.evaluations = 0
         self.archive = []
-        self.references = []
         populations = [
             [
                 self._evaluate(sample_design(self.variables, self.rng))
@@ -324,6 +485,18 @@ class IMICA:
             [individual for population in populations for individual in population]
         )
 
+        indicator_history: list[dict[str, Any]] = []
+        for island_index, population in enumerate(populations):
+            value = self._score_population(island_index, population)
+            self._record_indicator(
+                indicator_history,
+                0,
+                island_index,
+                population,
+                self.references[island_index],
+                value,
+            )
+
         generation = 0
         while self.evaluations < max_evaluations:
             for island_index, population in enumerate(populations):
@@ -331,9 +504,11 @@ class IMICA:
                     break
                 ranks = self._ranks(population)
                 offspring: list[Individual] = []
-                while len(offspring) < self.population_size and self.evaluations < max_evaluations:
-                    first = self._select_parent(population, ranks)
-                    second = self._select_parent(population, ranks)
+                while (
+                    len(offspring) < self.population_size
+                    and self.evaluations < max_evaluations
+                ):
+                    first, second = self._select_parents(population, ranks)
                     child_designs = make_offspring(
                         first.design, second.design, self.variables, self.rng
                     )
@@ -346,22 +521,62 @@ class IMICA:
                         offspring.append(self._evaluate(design))
 
                 if offspring:
+                    candidates = population + offspring
                     self._update_archive(offspring)
-                    self._update_reference(island_index, population + offspring)
-                    populations[island_index] = _survivors(
-                        population + offspring,
+                    reference = self.references[island_index]
+                    populations[island_index], value = _indicator_survivors(
+                        candidates,
                         self.population_size,
-                        self.references[island_index],
+                        self.indicators[island_index],
+                        reference,
+                    )
+                    self.references[island_index] = _nondominated_reference(
+                        reference, populations[island_index], self.population_size
+                    )
+                    self._record_indicator(
+                        indicator_history,
+                        generation + 1,
+                        island_index,
+                        populations[island_index],
+                        reference,
+                        value,
                     )
 
             generation += 1
             if generation % self.migration_interval == 0:
-                self._migrate(populations, self.references)
+                self._migrate(populations, indicator_history, generation)
 
+        final_values = [
+            self._score_population(index, population)
+            for index, population in enumerate(populations)
+        ]
         return {
             "archive": self.archive.copy(),
             "populations": populations,
             "references": [reference.copy() for reference in self.references],
+            "indicator_names": [indicator.name for indicator in self.indicators],
+            "indicator_values": final_values,
+            "indicator_history": indicator_history,
             "evaluations": self.evaluations,
             "generations": generation,
         }
+
+    def _score_population(
+        self, island_index: int, population: list[Individual]
+    ) -> float:
+        front = _fronts(population)[0]
+        points = np.vstack([population[index].objectives for index in front])
+        reference_front = _reference_objectives(self.references[island_index])
+        if reference_front.size == 0:
+            reference_front = points.copy()
+        normalized_points, normalized_reference = _normalize_indicator_inputs(
+            points, reference_front
+        )
+        reference_arg = (
+            normalized_reference
+            if self.indicators[island_index].requires_reference
+            else None
+        )
+        return _indicator_value(
+            self.indicators[island_index], normalized_points, reference_arg
+        )

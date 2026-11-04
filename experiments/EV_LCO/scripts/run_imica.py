@@ -9,11 +9,10 @@ from src.optimization import EVLCOProblem, IMICA
 
 
 def main():
-    problem = EVLCOProblem()
     optimizer = IMICA(
-        problem,
+        EVLCOProblem(),
         population_size=8,
-        islands=2,
+        islands=5,
         migration_interval=5,
         migrants=1,
         seed=42,
@@ -22,7 +21,10 @@ def main():
 
     print(f"Evaluations: {result['evaluations']}")
     print(f"Archive size: {len(result['archive'])}")
-    print(f"NDR reference sizes: {[len(ref) for ref in result['references']]}")
+    for island, (name, value) in enumerate(
+        zip(result["indicator_names"], result["indicator_values"])
+    ):
+        print(f"Island {island}: {name}={value:.6g}")
     if not any(individual.feasible for individual in result["archive"]):
         print(
             "No feasible design was found. The current battery evaluator is "

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from .indicators import hypervolume
 from .imica import Individual
 from .nsga3 import _associate, _reference_directions
 
@@ -17,42 +18,6 @@ def _nondominated_objectives(points: np.ndarray) -> np.ndarray:
         strictly_better = np.any(points < point, axis=1)
         dominated[index] = np.any(no_worse & strictly_better)
     return points[~dominated]
-
-
-def _hypervolume_recursive(points: np.ndarray, reference: np.ndarray) -> float:
-    if len(points) == 0:
-        return 0.0
-    points = points[np.all(points < reference, axis=1)]
-    if len(points) == 0:
-        return 0.0
-    points = _nondominated_objectives(points)
-    if points.shape[1] == 1:
-        return float(max(0.0, reference[0] - np.min(points[:, 0])))
-
-    levels = np.unique(points[:, -1])
-    volume = 0.0
-    for index, level in enumerate(levels):
-        upper = levels[index + 1] if index + 1 < len(levels) else reference[-1]
-        if upper <= level:
-            continue
-        active = points[points[:, -1] <= level, :-1]
-        volume += (upper - level) * _hypervolume_recursive(
-            active, reference[:-1]
-        )
-    return float(volume)
-
-
-def hypervolume(points: np.ndarray, reference: np.ndarray) -> float:
-    """Exact minimization hypervolume for a finite set of points."""
-    points = np.asarray(points, dtype=float)
-    reference = np.asarray(reference, dtype=float)
-    if points.ndim != 2 or reference.ndim != 1:
-        raise ValueError("Expected a 2D point array and a 1D reference point.")
-    if points.shape[1] != len(reference):
-        raise ValueError("Point and reference dimensions must match.")
-    if not np.all(np.isfinite(points)) or not np.all(np.isfinite(reference)):
-        raise ValueError("Hypervolume inputs must be finite.")
-    return _hypervolume_recursive(points, reference)
 
 
 def _igd_plus(approximation: np.ndarray, reference_front: np.ndarray) -> float:

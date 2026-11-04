@@ -9,6 +9,8 @@ from src.optimization.imica import (
     _nondominated_reference,
     _survivors,
 )
+from src.optimization.irbo import IRBO
+from src.optimization.indicators import DeltaP, EpsilonPlus, IGDPlus, R2, SMS
 from src.optimization.comparison_metrics import (
     evaluate_front,
     hypervolume,
@@ -215,9 +217,9 @@ class TestEVLCOProblemAdapter(unittest.TestCase):
         )
 
 
-class TestIMICA(unittest.TestCase):
+class TestIRBO(unittest.TestCase):
     def test_run_respects_budget_and_returns_nondominated_archive(self):
-        optimizer = IMICA(
+        optimizer = IRBO(
             QuadraticProblem(),
             population_size=8,
             islands=2,
@@ -240,10 +242,89 @@ class TestIMICA(unittest.TestCase):
             self.assertTrue(all(item.feasible for item in reference))
 
     def test_invalid_budget_is_rejected(self):
-        optimizer = IMICA(QuadraticProblem(), population_size=8, islands=2)
+        optimizer = IRBO(QuadraticProblem(), population_size=8, islands=2)
 
         with self.assertRaises(ValueError):
             optimizer.run(max_evaluations=15)
+
+
+class TestIndicators(unittest.TestCase):
+    def test_reference_indicators_are_zero_on_their_reference_front(self):
+        points = np.array([[0.0, 1.0], [1.0, 0.0]])
+
+        self.assertAlmostEqual(IGDPlus()(points, points), 0.0)
+        self.assertAlmostEqual(EpsilonPlus()(points, points), 0.0)
+        self.assertAlmostEqual(DeltaP()(points, points), 0.0)
+
+    def test_sms_and_r2_return_finite_scores(self):
+        points = np.array([[0.2, 0.8], [0.8, 0.2]])
+
+        self.assertAlmostEqual(SMS()(points), 0.45)
+        self.assertTrue(np.isfinite(R2()(points)))
+
+
+class TestIMICA(unittest.TestCase):
+    def test_each_island_evaluates_its_assigned_indicator(self):
+        indicators = [SMS(), IGDPlus()]
+        optimizer = IMICA(
+            QuadraticProblem(),
+            population_size=4,
+            islands=2,
+            indicators=indicators,
+            migration_interval=2,
+            migrants=1,
+            seed=17,
+        )
+
+        result = optimizer.run(max_evaluations=19)
+
+        self.assertEqual(result["evaluations"], 19)
+        self.assertEqual(result["indicator_names"], ["HV", "IGD+"])
+        self.assertEqual(len(result["indicator_values"]), 2)
+        self.assertTrue(all(np.isfinite(result["indicator_values"])))
+        self.assertEqual(
+            {(entry["island"], entry["indicator"]) for entry in result["indicator_history"]},
+            {(0, "HV"), (1, "IGD+")},
+        )
+        self.assertTrue(
+            all(
+                sum(entry["island"] == island for entry in result["indicator_history"])
+                >= 2
+                for island in range(2)
+            )
+        )
+        self.assertEqual([len(population) for population in result["populations"]], [4, 4])
+        self.assertEqual(len(result["references"]), 2)
+
+    def test_indicator_count_must_match_island_count(self):
+        with self.assertRaises(ValueError):
+            IMICA(
+                QuadraticProblem(),
+                islands=2,
+                indicators=[SMS()],
+            )
+
+    def test_default_indicator_assignment_supports_requested_island_count(self):
+        optimizer = IMICA(QuadraticProblem(), islands=3)
+
+        self.assertEqual(
+            [indicator.name for indicator in optimizer.indicators],
+            ["HV", "R2", "IGD+"],
+        )
+
+    def test_roulette_parent_selection_respects_evaluation_budget(self):
+        optimizer = IMICA(
+            QuadraticProblem(),
+            population_size=4,
+            islands=2,
+            migrants=0,
+            select_mode="Roulette",
+            seed=23,
+        )
+
+        result = optimizer.run(max_evaluations=11)
+
+        self.assertEqual(result["evaluations"], 11)
 
 
 if __name__ == "__main__":

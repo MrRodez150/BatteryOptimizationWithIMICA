@@ -8,7 +8,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from src.optimization import EVLCOProblem, IMICA, NSGA3
+from src.optimization import EVLCOProblem, IRBO, NSGA3
 from src.optimization.comparison_metrics import (
     evaluate_front,
     pooled_feasible_reference,
@@ -17,11 +17,11 @@ from src.optimization.comparison_metrics import (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Compare IMICA-NDR with NSGA-III under a shared EV/LCO problem."
+        description="Compare IRBO with NSGA-III under a shared EV/LCO problem."
     )
     parser.add_argument("--evaluations", type=int, default=2000)
     parser.add_argument("--population-size", type=int, default=40,
-                        help="NSGA-III population and size of each IMICA island.")
+                        help="NSGA-III population and size of each IRBO island.")
     parser.add_argument("--islands", type=int, default=5)
     parser.add_argument("--migration-interval", type=int, default=10)
     parser.add_argument("--migrants", type=int, default=2)
@@ -31,7 +31,7 @@ def parse_args():
         "--output",
         type=Path,
         default=Path(ROOT) / "experiments" / "EV_LCO" / "results"
-        / "imica_nsga3_comparison.csv",
+        / "irbo_nsga3_comparison.csv",
     )
     return parser.parse_args()
 
@@ -41,7 +41,7 @@ def main():
     total_population = args.population_size * args.islands
     if args.evaluations < total_population:
         raise ValueError(
-            "Evaluation budget must cover IMICA's initial population "
+            "Evaluation budget must cover IRBO's initial population "
             "across all islands."
         )
     if args.seeds < 1:
@@ -50,7 +50,7 @@ def main():
     runs = []
     for seed in range(args.seed_start, args.seed_start + args.seeds):
         problem = EVLCOProblem()
-        imica = IMICA(
+        irbo = IRBO(
             problem,
             population_size=args.population_size,
             islands=args.islands,
@@ -64,22 +64,22 @@ def main():
             population_size=total_population,
             seed=seed,
         ).run(args.evaluations)
-        runs.append((seed, imica, nsga3))
+        runs.append((seed, irbo, nsga3))
         print(
-            f"Seed {seed}: IMICA {imica['evaluations']} evals, "
+            f"Seed {seed}: IRBO {irbo['evaluations']} evals, "
             f"NSGA-III {nsga3['evaluations']} evals"
         )
 
     rows = []
-    for seed, imica_result, nsga3_result in runs:
+    for seed, irbo_result, nsga3_result in runs:
         pooled_reference = pooled_feasible_reference(
-            [imica_result["archive"], nsga3_result["archive"]]
+            [irbo_result["archive"], nsga3_result["archive"]]
         )
-        imica_metrics = evaluate_front(
-            imica_result["archive"],
+        irbo_metrics = evaluate_front(
+            irbo_result["archive"],
             [
                 individual
-                for population in imica_result["populations"]
+                for population in irbo_result["populations"]
                 for individual in population
             ],
             pooled_reference,
@@ -90,7 +90,7 @@ def main():
             pooled_reference,
         )
         for algorithm, result, metrics in (
-            ("IMICA-NDR", imica_result, imica_metrics),
+            ("IRBO", irbo_result, irbo_metrics),
             ("NSGA-III", nsga3_result, nsga3_metrics),
         ):
             rows.append(
