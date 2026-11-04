@@ -40,10 +40,13 @@ constraint-aware y debe validarse contra el protocolo final antes de usarla en
 resultados publicables.
 
 El evaluador `EVLCOBattery` todavía no es P2D: utiliza perfiles de voltaje y
-temperatura provisionales. Por ello, el runner sirve para probar el flujo y el
-presupuesto del algoritmo, no para producir resultados científicos. La
-integración del simulador P2D o de surrogates cuya validación esté documentada
-es un requisito previo a los experimentos finales.
+temperatura provisionales. Por ello, el runner actual sirve para probar el
+flujo y el presupuesto del algoritmo, no para afirmar que ya se optimiza el
+modelo P2D. El benchmark del artículo usará el P2D Ai2020 de referencia una vez
+integrado como evaluador; sus resultados sustentarán conclusiones sobre el
+desempeño relativo de los algoritmos en ese problema definido, no sobre la
+exactitud física o predictiva de una celda real. La validación experimental
+de la celda queda como trabajo futuro.
 
 ## Comparación con NSGA-III
 
@@ -61,8 +64,9 @@ También reporta ocupación de direcciones y variación de distancias entre
 vecinos. Esta referencia es una aproximación dependiente de los algoritmos,
 no una solución exacta: las métricas permiten una comparación empírica, pero
 no prueban optimalidad global ni superioridad universal. Se requieren varias
-semillas, análisis pareado y un evaluador P2D/surrogate validado antes de
-extraer conclusiones científicas.
+semillas y análisis pareado. Las conclusiones deberán limitarse al desempeño
+observado sobre el problema de referencia; la validación electroquímica frente
+a la celda experimental es un trabajo futuro independiente.
 
 ## API breve
 

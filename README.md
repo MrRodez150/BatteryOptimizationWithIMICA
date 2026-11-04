@@ -6,7 +6,8 @@ Esta carpeta corresponde a la tercera y última versión del proyecto, enfocada 
 
 - Aplicación: EV
 - Química: LCO
-- Enfoque: formulación física coherente, validación con P2D y comparación justa con NSGA-III
+- Enfoque: evaluación de la capacidad de optimización de IMICA en un problema
+  reproducible EV/LCO y comparación justa con NSGA-III
 - Objetivo: dejar una versión final reproducible y sustentada por resultados consistentes con la revisión
 
 ## Estructura
@@ -45,12 +46,27 @@ python -m unittest discover -s tests -v
 python experiments\EV_LCO\scripts\run_imica.py
 ```
 
-**Importante:** el evaluador de batería actual sigue siendo un baseline
-provisional y no resuelve las ecuaciones P2D. Sus salidas no son resultados
-científicos ni deben usarse para conclusiones; IMICA debe conectarse al
-simulador P2D o a surrogates validados antes de ejecutar los experimentos
-finales.
+**Importante:** el evaluador de batería de `src/core/battery.py` sigue siendo
+un baseline provisional y no está conectado al núcleo `src/p2d/`. El P2D
+incluye un set de referencia Ai2020 con OCP LCO/grafito rastreables para
+verificación numérica, pero tampoco está parametrizado ni validado contra la
+celda experimental objetivo. Por tanto, los resultados del artículo se
+limitarán a comparar el desempeño de optimización sobre el problema de
+referencia definido; no demostrarán la precisión del modelo de batería ni la
+validez de sus predicciones para una celda real. La validación experimental se
+plantea como trabajo futuro.
 
-Pendiente: validar la formulación física, completar la selección/referencia del
-algoritmo frente a la especificación de V2 y conectar los evaluadores P2D y
-surrogate.
+Pendiente: conectar el evaluador de IMICA al P2D de referencia, restringirlo a
+un dominio numéricamente válido, completar la selección/referencia del
+algoritmo frente a la especificación de V2 y definir el protocolo de
+comparación.
+
+## Base del simulador P2D
+
+La base numérica de malla axial, difusión radial, transporte de electrolito,
+cinética y descarga galvanostática está en `src/p2d/`. El avance de especies
+usa división de operadores; el set Ai2020 aporta parámetros y OCP de referencia
+para verificación numérica. El módulo P2D aún no está conectado al evaluador
+que utiliza IMICA, y su respuesta no ha sido validada frente a la celda
+experimental; el alcance y las limitaciones están en
+`docs/p2d_implementation.md`.
