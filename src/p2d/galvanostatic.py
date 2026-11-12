@@ -5,10 +5,11 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.optimize import least_squares
 
-from .electrolyte import ElectrolyteTransport
+from .electrolyte import ElectrolyteTransport, electrolyte_conductivity_s_m
 from .kinetics import ButlerVolmerKinetics
 from .ocp import TabulatedOpenCircuitPotential
 from .particle import FARADAY_CONSTANT_C_MOL, SphericalParticleDiffusion
+from .sei import SEIGrowthParameters
 from .solid_potential import SolidPotentialState, solve_solid_potential
 
 
@@ -23,14 +24,24 @@ class ElectrochemicalSpeciesState:
 class DischargeTrajectory:
     time_s: np.ndarray
     voltage_v: np.ndarray
+    ohmic_power_loss_w_m2: np.ndarray
     final_species_state: ElectrochemicalSpeciesState
     reached_cutoff: bool
+    reached_stoichiometry_limit: bool
+    minimum_electrolyte_concentration_mol_m3: float
+    minimum_positive_surface_stoichiometry: float
+    maximum_positive_surface_stoichiometry: float
+    minimum_negative_surface_stoichiometry: float
+    maximum_negative_surface_stoichiometry: float
+    final_sei_thickness_m: np.ndarray
+    lithium_loss_to_sei_mol_m2: float
 
 
 @dataclass(frozen=True)
 class GalvanostaticState:
     positive_reaction_current_a_m3: np.ndarray
     negative_reaction_current_a_m3: np.ndarray
+    negative_sei_reaction_current_a_m3: np.ndarray
     electrolyte_potential_v: np.ndarray
     positive_solid_potential_v: np.ndarray
     negative_solid_potential_v: np.ndarray
@@ -120,10 +131,14 @@ class GalvanostaticElectrochemistry:
         positive_surface_concentration_mol_m3: np.ndarray,
         negative_surface_concentration_mol_m3: np.ndarray,
         temperature_k: np.ndarray | float = 298.15,
+        sei_thickness_m: np.ndarray | None = None,
+        sei_parameters: SEIGrowthParameters | None = None,
     ) -> GalvanostaticState:
-        """Solve BV kinetics and both phase charge balances at fixed current."""
-        if not np.isfinite(applied_current_a_m2) or applied_current_a_m2 < 0.0:
-            raise ValueError("Discharge current density must be finite and nonnegative.")
+        """Solve galvanostatic charge balance; positive current denotes discharge."""
+        if not np.isfinite(applied_current_a_m2):
+            raise ValueError("Applied current density must be finite.")
+        if sei_parameters is None and sei_thickness_m is not None:
+            raise ValueError("sei_parameters are required when thickness is provided.")
 
         grid = self.electrolyte.grid
         widths = grid.cell_widths_m
@@ -167,7 +182,24 @@ class GalvanostaticElectrochemistry:
             negative_surface / self.negative_kinetics.maximum_concentration_mol_m3,
             negative_temperature,
         )
-        current_scale = max(applied_current_a_m2, 1.0)
+        if sei_parameters is None:
+            sei_thickness = np.zeros(negative_widths.size, dtype=float)
+        elif sei_thickness_m is None:
+            sei_thickness = np.full(
+                negative_widths.size, sei_parameters.initial_thickness_m
+            )
+        else:
+            sei_thickness = np.asarray(sei_thickness_m, dtype=float)
+            if (
+                sei_thickness.shape != (negative_widths.size,)
+                or not np.all(np.isfinite(sei_thickness))
+                or np.any(sei_thickness <= 0.0)
+            ):
+                raise ValueError(
+                    "sei_thickness_m must be positive, finite, and match the "
+                    "negative-electrode cell count."
+                )
+        current_scale = max(abs(applied_current_a_m2), 1.0)
         positive_reaction_scale = current_scale / float(np.sum(positive_widths))
         negative_reaction_scale = current_scale / float(np.sum(negative_widths))
 
@@ -179,16 +211,30 @@ class GalvanostaticElectrochemistry:
             self.negative_interfacial_area_m_inv.size,
             applied_current_a_m2 / float(np.sum(negative_widths)),
         )
+        variable_count_positive = positive_guess.size
+        variable_count_negative = negative_guess.size
+        sei_current_scale = (
+            sei_parameters.exchange_current_density_a_m2
+            if sei_parameters is not None
+            else 1.0
+        )
+        sei_guess = (
+            np.full(variable_count_negative, -sei_current_scale)
+            if sei_parameters is not None
+            else np.empty(0, dtype=float)
+        )
         variables = np.concatenate(
             (
                 positive_guess / positive_reaction_scale,
                 negative_guess / negative_reaction_scale,
+                sei_guess / sei_current_scale,
                 positive_ocp[:1],
                 negative_ocp[:1],
             )
         )
-        variable_count_positive = positive_guess.size
-        variable_count_negative = negative_guess.size
+        sei_start = variable_count_positive + variable_count_negative
+        positive_collector_index = variables.size - 2
+        negative_collector_index = variables.size - 1
 
         def residual(values: np.ndarray) -> np.ndarray:
             positive_reaction = (
@@ -201,12 +247,25 @@ class GalvanostaticElectrochemistry:
                 ]
                 * negative_reaction_scale
             )
-            positive_collector_potential = values[-2]
-            negative_collector_potential = values[-1]
+            if sei_parameters is None:
+                sei_interfacial_current = np.zeros(variable_count_negative)
+            else:
+                sei_interfacial_current = (
+                    values[
+                        sei_start : sei_start + variable_count_negative
+                    ]
+                    * sei_current_scale
+                )
+            positive_collector_potential = values[positive_collector_index]
+            negative_collector_potential = values[negative_collector_index]
+            negative_sei_reaction = (
+                self.negative_interfacial_area_m_inv * sei_interfacial_current
+            )
+            negative_total_reaction = negative_reaction + negative_sei_reaction
 
             volumetric_reaction = np.zeros(widths.size, dtype=float)
             volumetric_reaction[positive_slice] = positive_reaction
-            volumetric_reaction[negative_slice] = negative_reaction
+            volumetric_reaction[negative_slice] = negative_total_reaction
             electrolyte_right_current = float(np.dot(widths, volumetric_reaction))
             electrolyte_state = self.electrolyte.solve_potential(
                 concentration_mol_m3=electrolyte_concentration,
@@ -221,7 +280,7 @@ class GalvanostaticElectrochemistry:
                 applied_current_a_m2,
             )
             negative_solid = self._negative_solid_state(
-                negative_reaction,
+                negative_total_reaction,
                 negative_collector_potential,
             )
 
@@ -251,23 +310,40 @@ class GalvanostaticElectrochemistry:
                     negative_temperature,
                 )
             )
+            residual_parts = [
+                (positive_reaction - predicted_positive) / positive_reaction_scale,
+                (negative_reaction - predicted_negative) / negative_reaction_scale,
+            ]
+            if sei_parameters is not None:
+                main_interfacial_current = (
+                    negative_reaction / self.negative_interfacial_area_m_inv
+                )
+                sei_overpotential = (
+                    negative_solid.potential_v
+                    - electrolyte_state.potential_v[negative_slice]
+                    - sei_parameters.open_circuit_potential_v
+                    - main_interfacial_current
+                    * sei_thickness
+                    * sei_parameters.resistivity_ohm_m
+                )
+                predicted_sei = sei_parameters.current_density_a_m2(
+                    sei_overpotential, negative_temperature
+                )
+                residual_parts.append(
+                    (sei_interfacial_current - predicted_sei) / sei_current_scale
+                )
             positive_constraint = (
                 float(np.dot(positive_widths, positive_reaction))
                 + applied_current_a_m2
             ) / current_scale
             negative_constraint = (
-                float(np.dot(negative_widths, negative_reaction))
+                float(np.dot(negative_widths, negative_total_reaction))
                 - applied_current_a_m2
             ) / current_scale
-            return np.concatenate(
-                (
-                    (positive_reaction - predicted_positive)
-                    / positive_reaction_scale,
-                    (negative_reaction - predicted_negative)
-                    / negative_reaction_scale,
-                    [positive_constraint, negative_constraint],
-                )
+            residual_parts.append(
+                np.asarray([positive_constraint, negative_constraint])
             )
+            return np.concatenate(residual_parts)
 
         solution = least_squares(
             residual,
@@ -301,19 +377,30 @@ class GalvanostaticElectrochemistry:
             ]
             * negative_reaction_scale
         )
-        positive_collector_potential = float(solution.x[-2])
-        negative_collector_potential = float(solution.x[-1])
+        if sei_parameters is None:
+            sei_interfacial_current = np.zeros(variable_count_negative)
+        else:
+            sei_interfacial_current = (
+                solution.x[sei_start : sei_start + variable_count_negative]
+                * sei_current_scale
+            )
+        negative_sei_reaction = (
+            self.negative_interfacial_area_m_inv * sei_interfacial_current
+        )
+        negative_total_reaction = negative_reaction + negative_sei_reaction
+        positive_collector_potential = float(solution.x[positive_collector_index])
+        negative_collector_potential = float(solution.x[negative_collector_index])
 
         volumetric_reaction = np.zeros(widths.size, dtype=float)
         volumetric_reaction[positive_slice] = positive_reaction
-        volumetric_reaction[negative_slice] = negative_reaction
+        volumetric_reaction[negative_slice] = negative_total_reaction
         net_ionic_current = float(np.dot(widths, volumetric_reaction))
         positive_current_error = abs(
             float(np.dot(positive_widths, positive_reaction))
             + applied_current_a_m2
         )
         negative_current_error = abs(
-            float(np.dot(negative_widths, negative_reaction))
+            float(np.dot(negative_widths, negative_total_reaction))
             - applied_current_a_m2
         )
         if max(positive_current_error, negative_current_error, abs(net_ionic_current)) > (
@@ -338,7 +425,7 @@ class GalvanostaticElectrochemistry:
             applied_current_a_m2,
         )
         negative_solid = self._negative_solid_state(
-            negative_reaction,
+            negative_total_reaction,
             negative_collector_potential,
         )
         positive_collector = self._positive_collector_value(
@@ -349,6 +436,7 @@ class GalvanostaticElectrochemistry:
         return GalvanostaticState(
             positive_reaction_current_a_m3=positive_reaction,
             negative_reaction_current_a_m3=negative_reaction,
+            negative_sei_reaction_current_a_m3=negative_sei_reaction,
             electrolyte_potential_v=electrolyte_state.potential_v,
             positive_solid_potential_v=positive_solid.potential_v,
             negative_solid_potential_v=negative_solid.potential_v,
@@ -374,14 +462,36 @@ class GalvanostaticElectrochemistry:
         maximum_steps: int,
         cutoff_voltage_v: float = 2.5,
         temperature_k: np.ndarray | float = 298.15,
+        upper_cutoff_voltage_v: float | None = None,
+        sei_parameters: SEIGrowthParameters | None = None,
+        sei_thickness_initial_m: np.ndarray | None = None,
     ) -> DischargeTrajectory:
-        """Run a bounded galvanostatic discharge using split species updates."""
+        """Run a bounded signed-current phase with split species updates.
+
+        Positive current discharges to ``cutoff_voltage_v``; negative current
+        charges to ``upper_cutoff_voltage_v``.
+        """
+        if not np.isfinite(applied_current_a_m2):
+            raise ValueError("Applied current density must be finite.")
         if not isinstance(maximum_steps, int) or maximum_steps < 1:
             raise ValueError("maximum_steps must be a positive integer.")
         if not np.isfinite(cutoff_voltage_v) or cutoff_voltage_v <= 0.0:
             raise ValueError("cutoff_voltage_v must be positive and finite.")
+        if applied_current_a_m2 < 0.0 and upper_cutoff_voltage_v is None:
+            raise ValueError("Charging requires upper_cutoff_voltage_v.")
+        if upper_cutoff_voltage_v is not None and (
+            not np.isfinite(upper_cutoff_voltage_v)
+            or upper_cutoff_voltage_v <= cutoff_voltage_v
+        ):
+            raise ValueError(
+                "upper_cutoff_voltage_v must be finite and exceed cutoff_voltage_v."
+            )
         if not np.isfinite(time_step_s) or time_step_s <= 0.0:
             raise ValueError("time_step_s must be positive and finite.")
+        if sei_parameters is None and sei_thickness_initial_m is not None:
+            raise ValueError(
+                "sei_parameters are required when initial thickness is provided."
+            )
 
         species = ElectrochemicalSpeciesState(
             electrolyte_concentration_mol_m3=np.asarray(
@@ -394,9 +504,39 @@ class GalvanostaticElectrochemistry:
                 negative_particle_concentration_initial_mol_m3, dtype=float
             ).copy(),
         )
+        negative_cell_count = self.electrolyte.grid.negative_cells
+        if sei_parameters is None:
+            sei_thickness = np.zeros(negative_cell_count, dtype=float)
+        elif sei_thickness_initial_m is None:
+            sei_thickness = np.full(
+                negative_cell_count, sei_parameters.initial_thickness_m
+            )
+        else:
+            sei_thickness = np.asarray(sei_thickness_initial_m, dtype=float).copy()
+            if (
+                sei_thickness.shape != (negative_cell_count,)
+                or not np.all(np.isfinite(sei_thickness))
+                or np.any(sei_thickness <= 0.0)
+            ):
+                raise ValueError(
+                    "sei_thickness_initial_m must be positive, finite, and match "
+                    "the negative-electrode cell count."
+                )
         times = [0.0]
         voltages: list[float] = []
+        ohmic_power_losses: list[float] = []
         reached_cutoff = False
+        reached_stoichiometry_limit = False
+        minimum_electrolyte_concentration = float("inf")
+        positive_stoichiometries: list[float] = []
+        negative_stoichiometries: list[float] = []
+        lithium_loss_to_sei_mol_m2 = 0.0
+        previous_species: ElectrochemicalSpeciesState | None = None
+        previous_sei_thickness: np.ndarray | None = None
+        previous_lithium_loss_to_sei_mol_m2 = 0.0
+        negative_widths = self.electrolyte.grid.cell_widths_m[
+            self.electrolyte.grid.region_slices["negative_electrode"]
+        ]
 
         for step_index in range(maximum_steps + 1):
             positive_surface = np.asarray(
@@ -417,21 +557,116 @@ class GalvanostaticElectrochemistry:
                     )
                 ]
             )
+            minimum_electrolyte_concentration = min(
+                minimum_electrolyte_concentration,
+                float(np.min(species.electrolyte_concentration_mol_m3)),
+            )
+            positive_stoichiometries.extend(
+                positive_surface / self.positive_kinetics.maximum_concentration_mol_m3
+            )
+            negative_stoichiometries.extend(
+                negative_surface / self.negative_kinetics.maximum_concentration_mol_m3
+            )
             state = self.solve(
                 applied_current_a_m2=applied_current_a_m2,
                 electrolyte_concentration_mol_m3=species.electrolyte_concentration_mol_m3,
                 positive_surface_concentration_mol_m3=positive_surface,
                 negative_surface_concentration_mol_m3=negative_surface,
                 temperature_k=temperature_k,
+                sei_thickness_m=(
+                    sei_thickness if sei_parameters is not None else None
+                ),
+                sei_parameters=sei_parameters,
             )
             voltages.append(state.cell_voltage_v)
-            if state.cell_voltage_v <= cutoff_voltage_v:
+            ohmic_power_losses.append(
+                self._ohmic_power_loss_w_m2(
+                    state,
+                    species.electrolyte_concentration_mol_m3,
+                    temperature_k,
+                )
+            )
+            reached_voltage_limit = (
+                state.cell_voltage_v <= cutoff_voltage_v
+                if applied_current_a_m2 >= 0.0
+                else state.cell_voltage_v >= float(upper_cutoff_voltage_v)
+            )
+            if reached_voltage_limit:
+                if len(voltages) > 1:
+                    previous_voltage = voltages[-2]
+                    voltage_limit = (
+                        cutoff_voltage_v
+                        if applied_current_a_m2 >= 0.0
+                        else float(upper_cutoff_voltage_v)
+                    )
+                    crossed_limit = (
+                        previous_voltage > voltage_limit
+                        and state.cell_voltage_v <= voltage_limit
+                        if applied_current_a_m2 >= 0.0
+                        else previous_voltage < voltage_limit
+                        and state.cell_voltage_v >= voltage_limit
+                    )
+                    if crossed_limit and previous_species is not None:
+                        fraction = (
+                            voltage_limit - previous_voltage
+                        ) / (state.cell_voltage_v - previous_voltage)
+                        if 0.0 <= fraction <= 1.0:
+                            species = ElectrochemicalSpeciesState(
+                                electrolyte_concentration_mol_m3=(
+                                    previous_species.electrolyte_concentration_mol_m3
+                                    + fraction
+                                    * (
+                                        species.electrolyte_concentration_mol_m3
+                                        - previous_species.electrolyte_concentration_mol_m3
+                                    )
+                                ),
+                                positive_particle_concentration_mol_m3=(
+                                    previous_species.positive_particle_concentration_mol_m3
+                                    + fraction
+                                    * (
+                                        species.positive_particle_concentration_mol_m3
+                                        - previous_species.positive_particle_concentration_mol_m3
+                                    )
+                                ),
+                                negative_particle_concentration_mol_m3=(
+                                    previous_species.negative_particle_concentration_mol_m3
+                                    + fraction
+                                    * (
+                                        species.negative_particle_concentration_mol_m3
+                                        - previous_species.negative_particle_concentration_mol_m3
+                                    )
+                                ),
+                            )
+                            if previous_sei_thickness is not None:
+                                sei_thickness = previous_sei_thickness + fraction * (
+                                    sei_thickness - previous_sei_thickness
+                                )
+                            lithium_loss_to_sei_mol_m2 = (
+                                previous_lithium_loss_to_sei_mol_m2
+                                + fraction
+                                * (
+                                    lithium_loss_to_sei_mol_m2
+                                    - previous_lithium_loss_to_sei_mol_m2
+                                )
+                            )
+                            times[-1] = times[-2] + fraction * (
+                                times[-1] - times[-2]
+                            )
+                            voltages[-1] = voltage_limit
+                            ohmic_power_losses[-1] = (
+                                ohmic_power_losses[-2]
+                                + fraction
+                                * (
+                                    ohmic_power_losses[-1]
+                                    - ohmic_power_losses[-2]
+                                )
+                            )
                 reached_cutoff = True
                 break
             if step_index == maximum_steps:
                 break
 
-            species = self.advance_species(
+            next_species = self.advance_species(
                 electrochemical_state=state,
                 electrolyte_concentration_old_mol_m3=species.electrolyte_concentration_mol_m3,
                 positive_particle_concentration_old_mol_m3=species.positive_particle_concentration_mol_m3,
@@ -441,14 +676,147 @@ class GalvanostaticElectrochemistry:
                 time_step_s=time_step_s,
                 temperature_k=temperature_k,
             )
+            next_positive_surface = np.asarray(
+                [
+                    particle.surface_concentration_mol_m3(profile)
+                    for particle, profile in zip(
+                        positive_particles,
+                        next_species.positive_particle_concentration_mol_m3,
+                    )
+                ]
+            )
+            next_negative_surface = np.asarray(
+                [
+                    particle.surface_concentration_mol_m3(profile)
+                    for particle, profile in zip(
+                        negative_particles,
+                        next_species.negative_particle_concentration_mol_m3,
+                    )
+                ]
+            )
+            positive_theta = (
+                next_positive_surface
+                / self.positive_kinetics.maximum_concentration_mol_m3
+            )
+            negative_theta = (
+                next_negative_surface
+                / self.negative_kinetics.maximum_concentration_mol_m3
+            )
+            if (
+                np.any(positive_theta < self.positive_ocp.stoichiometry[0])
+                or np.any(positive_theta > self.positive_ocp.stoichiometry[-1])
+                or np.any(negative_theta < self.negative_ocp.stoichiometry[0])
+                or np.any(negative_theta > self.negative_ocp.stoichiometry[-1])
+            ):
+                reached_stoichiometry_limit = True
+                break
+            previous_species = species
+            previous_sei_thickness = sei_thickness.copy()
+            previous_lithium_loss_to_sei_mol_m2 = (
+                lithium_loss_to_sei_mol_m2
+            )
+            if sei_parameters is not None:
+                sei_interfacial_current = (
+                    state.negative_sei_reaction_current_a_m3
+                    / self.negative_interfacial_area_m_inv
+                )
+                next_sei_thickness = sei_thickness - (
+                    sei_interfacial_current
+                    * sei_parameters.partial_molar_volume_m3_mol
+                    * time_step_s
+                    / (
+                        FARADAY_CONSTANT_C_MOL
+                        * sei_parameters.lithium_to_sei_mole_ratio
+                    )
+                )
+                if np.any(next_sei_thickness <= 0.0) or not np.all(
+                    np.isfinite(next_sei_thickness)
+                ):
+                    raise RuntimeError("SEI thickness became non-positive or non-finite.")
+                lithium_loss_to_sei_mol_m2 += float(
+                    -np.dot(
+                        negative_widths,
+                        state.negative_sei_reaction_current_a_m3,
+                    )
+                    * time_step_s
+                    / FARADAY_CONSTANT_C_MOL
+                )
+            if sei_parameters is not None:
+                sei_thickness = next_sei_thickness
+            species = next_species
             times.append((step_index + 1) * time_step_s)
 
         return DischargeTrajectory(
             time_s=np.asarray(times, dtype=float),
             voltage_v=np.asarray(voltages, dtype=float),
+            ohmic_power_loss_w_m2=np.asarray(ohmic_power_losses, dtype=float),
             final_species_state=species,
             reached_cutoff=reached_cutoff,
+            reached_stoichiometry_limit=reached_stoichiometry_limit,
+            minimum_electrolyte_concentration_mol_m3=(
+                minimum_electrolyte_concentration
+            ),
+            minimum_positive_surface_stoichiometry=min(positive_stoichiometries),
+            maximum_positive_surface_stoichiometry=max(positive_stoichiometries),
+            minimum_negative_surface_stoichiometry=min(negative_stoichiometries),
+            maximum_negative_surface_stoichiometry=max(negative_stoichiometries),
+            final_sei_thickness_m=sei_thickness.copy(),
+            lithium_loss_to_sei_mol_m2=lithium_loss_to_sei_mol_m2,
         )
+
+    def _ohmic_power_loss_w_m2(
+        self,
+        state: GalvanostaticState,
+        electrolyte_concentration_mol_m3: np.ndarray,
+        temperature_k: np.ndarray | float,
+    ) -> float:
+        """Integrate Joule dissipation in electrolyte and electrode solids."""
+        widths = self.electrolyte.grid.cell_widths_m
+        concentration = self.electrolyte._cell_state(
+            electrolyte_concentration_mol_m3,
+            "electrolyte_concentration_mol_m3",
+            positive=True,
+        )
+        temperature = self.electrolyte._cell_state(
+            temperature_k, "temperature_k", positive=True
+        )
+        electrolyte_conductivity = electrolyte_conductivity_s_m(
+            concentration, temperature
+        ) * self.electrolyte.porosity**self.electrolyte.bruggeman_exponent
+        electrolyte_current = 0.5 * (
+            state.electrolyte_current_faces_a_m2[:-1]
+            + state.electrolyte_current_faces_a_m2[1:]
+        )
+        power = float(
+            np.sum(electrolyte_current**2 / electrolyte_conductivity * widths)
+        )
+
+        positive_slice = self.electrolyte.grid.region_slices["positive_electrode"]
+        negative_slice = self.electrolyte.grid.region_slices["negative_electrode"]
+        for current_faces, conductivity, region, name in (
+            (
+                state.positive_solid_current_faces_a_m2,
+                self.positive_effective_conductivity_s_m,
+                positive_slice,
+                "positive solid",
+            ),
+            (
+                state.negative_solid_current_faces_a_m2,
+                self.negative_effective_conductivity_s_m,
+                negative_slice,
+                "negative solid",
+            ),
+        ):
+            region_widths = widths[region]
+            cell_current = 0.5 * (current_faces[:-1] + current_faces[1:])
+            if cell_current.shape != region_widths.shape:
+                raise ValueError(f"{name} current field does not match the grid.")
+            power += float(
+                np.sum(cell_current**2 / conductivity * region_widths)
+            )
+        if not np.isfinite(power) or power < 0.0:
+            raise RuntimeError("P2D ohmic power loss is non-finite or negative.")
+        return power
 
     def advance_species(
         self,
@@ -555,6 +923,7 @@ class GalvanostaticElectrochemistry:
         )
         electrolyte_reaction[negative_slice] = (
             electrochemical_state.negative_reaction_current_a_m3
+            + electrochemical_state.negative_sei_reaction_current_a_m3
         )
         electrolyte_updated = self.electrolyte.advance_concentration(
             electrolyte_concentration_old_mol_m3,

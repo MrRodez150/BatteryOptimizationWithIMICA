@@ -16,6 +16,7 @@ from .grid import ElectrochemicalGrid1D
 from .kinetics import ButlerVolmerKinetics, reaction_overpotential_v
 from .ocp import TabulatedOpenCircuitPotential
 from .particle import SphericalParticleDiffusion
+from .sei import AI2020_SEI_PARAMETERS, SEIGrowthParameters
 from .reference_parameters import (
     AI2020_PARAMETER_SOURCE,
     AI2020_SOURCE_COMMIT,
@@ -39,9 +40,11 @@ __all__ = [
     "ElectrolytePotentialState",
     "ElectrolyteTransport",
     "SphericalParticleDiffusion",
+    "SEIGrowthParameters",
     "SolidPotentialState",
     "TabulatedOpenCircuitPotential",
     "Ai2020ReferenceModel",
+    "AI2020_SEI_PARAMETERS",
     "build_ai2020_reference_model",
     "electrolyte_conductivity_s_m",
     "electrolyte_diffusivity_m2_s",

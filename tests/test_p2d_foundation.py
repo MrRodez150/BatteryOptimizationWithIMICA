@@ -2,6 +2,7 @@ import unittest
 
 import numpy as np
 
+from src.core.p2d_evaluator import P2DEvaluator
 from src.p2d import (
     ButlerVolmerKinetics,
     ElectrochemicalGrid1D,
@@ -10,6 +11,7 @@ from src.p2d import (
     SphericalParticleDiffusion,
     TabulatedOpenCircuitPotential,
     AI2020_SOURCE_COMMIT,
+    AI2020_SEI_PARAMETERS,
     build_ai2020_reference_model,
     load_ai2020_reference_ocps,
     electrolyte_conductivity_s_m,
@@ -17,6 +19,142 @@ from src.p2d import (
     reaction_overpotential_v,
     solve_solid_potential,
 )
+
+
+class TestP2DEvaluator(unittest.TestCase):
+    def setUp(self):
+        self.design = {
+            "C": 0.2,
+            "lp": 100e-6,
+            "lo": 25e-6,
+            "ln": 100e-6,
+            "Rp": 3e-6,
+            "Rn": 5e-6,
+            "efp": 0.55,
+            "efo": 0.3,
+            "efn": 0.55,
+            "la": 20e-6,
+            "lz": 20e-6,
+            "Lh": 80e-3,
+            "Rcell": 10e-3,
+            "Ns": 14,
+            "Np": 2,
+        }
+        self.evaluator = P2DEvaluator(
+            positive_cells=2,
+            separator_cells=1,
+            negative_cells=2,
+            radial_cells=4,
+            time_step_s=0.5,
+            maximum_steps=2,
+            aging_cycles=None,
+        )
+
+    def test_design_returns_reproducible_energy_constraints_and_discharge(self):
+        first = self.evaluator.evaluate(self.design)
+        second = self.evaluator.evaluate(self.design)
+
+        self.assertGreater(first["objectives"]["specific_energy"], 0.0)
+        self.assertGreater(first["objectives"]["ohmic_energy_loss_j_m2"], 0.0)
+        self.assertGreater(first["objectives"]["price"], 0.0)
+        self.assertEqual(first["objectives"], second["objectives"])
+        self.assertEqual(first["constraints"], second["constraints"])
+        self.assertEqual(first["metrics"], second["metrics"])
+        np.testing.assert_array_equal(
+            first["trajectory"]["time_s"], second["trajectory"]["time_s"]
+        )
+        np.testing.assert_array_equal(
+            first["trajectory"]["voltage_v"], second["trajectory"]["voltage_v"]
+        )
+        np.testing.assert_array_equal(
+            first["trajectory"]["ohmic_power_loss_w_m2"],
+            second["trajectory"]["ohmic_power_loss_w_m2"],
+        )
+        self.assertEqual(
+            first["trajectory"]["time_s"].shape,
+            first["trajectory"]["ohmic_power_loss_w_m2"].shape,
+        )
+        self.assertGreaterEqual(first["metrics"]["ohmic_energy_loss_fraction"], 0.0)
+        self.assertLessEqual(first["metrics"]["ohmic_energy_loss_fraction"], 1.0)
+        self.assertAlmostEqual(
+            first["metrics"]["ohmic_energy_loss_j_m2"],
+            first["objectives"]["ohmic_energy_loss_j_m2"],
+        )
+        for region, expected in (
+            ("positive", 0.45),
+            ("separator", 0.7),
+            ("negative", 0.45),
+        ):
+            self.assertAlmostEqual(
+                first["mapped_parameters"]["electrolyte_porosity"][region],
+                expected,
+            )
+        self.assertEqual(
+            first["trajectory"]["time_s"].shape,
+            first["trajectory"]["voltage_v"].shape,
+        )
+        self.assertTrue(
+            all(np.isfinite(value) for value in first["constraints"].values())
+        )
+        self.assertEqual(first["constraints"]["discharge_completion"], 1.0)
+        self.assertLessEqual(first["constraints"]["maximum_voltage"], 0.0)
+        self.assertLessEqual(
+            first["constraints"]["electrolyte_concentration_nonnegative"], 0.0
+        )
+        self.assertAlmostEqual(
+            first["metrics"]["applied_current_a_m2"],
+            self.design["C"] * first["metrics"]["theoretical_capacity_ah_m2"],
+        )
+        self.assertEqual(first["metrics"]["pack_cell_count"], 28)
+        self.assertAlmostEqual(
+            first["objectives"]["price"],
+            sum(first["metrics"]["material_costs_usd"].values()),
+        )
+        self.assertEqual(
+            set(first["metrics"]["material_costs_usd"]),
+            {"LCO", "graphite", "separator", "electrolyte", "aluminum", "copper"},
+        )
+        self.assertEqual(
+            set(first["metrics"]["material_masses_kg"]),
+            set(first["metrics"]["material_costs_usd"]),
+        )
+
+    def test_pack_material_cost_scales_with_series_and_parallel_cells(self):
+        baseline = self.evaluator.evaluate(self.design)
+        doubled_pack = dict(self.design)
+        doubled_pack["Ns"] *= 2
+        doubled_pack["Np"] *= 2
+        scaled = self.evaluator.evaluate(doubled_pack)
+
+        self.assertAlmostEqual(
+            scaled["objectives"]["price"],
+            4.0 * baseline["objectives"]["price"],
+        )
+        for material, baseline_cost in baseline["metrics"][
+            "material_costs_usd"
+        ].items():
+            self.assertAlmostEqual(
+                scaled["metrics"]["material_costs_usd"][material],
+                4.0 * baseline_cost,
+            )
+
+    def test_design_must_include_all_p2d_inputs(self):
+        incomplete = dict(self.design)
+        del incomplete["C"]
+
+        with self.assertRaisesRegex(ValueError, "missing variables"):
+            self.evaluator.evaluate(incomplete)
+
+    def test_default_aging_protocol_uses_selected_voltage_cutoffs(self):
+        evaluator = P2DEvaluator()
+
+        self.assertEqual(evaluator.positive_cells, 8)
+        self.assertEqual(evaluator.separator_cells, 3)
+        self.assertEqual(evaluator.negative_cells, 8)
+        self.assertEqual(evaluator.radial_cells, 12)
+        self.assertEqual(evaluator.aging_cycles, 20)
+        self.assertEqual(evaluator.aging_discharge_cutoff_voltage_v, 3.4)
+        self.assertEqual(evaluator.charge_cutoff_voltage_v, 4.0)
 
 
 class TestElectrochemicalGrid1D(unittest.TestCase):
@@ -589,6 +727,170 @@ class TestGalvanostaticElectrochemistry(unittest.TestCase):
         )
         self.assertGreater(state.cell_voltage_v, 0.0)
         self.assertLess(state.nonlinear_residual_norm, 1e-7)
+
+    def test_charge_reverses_reaction_current_and_increases_voltage(self):
+        discharge = self.solve(1.0)
+        charge = self.solve(-1.0)
+        widths = self.grid.cell_widths_m
+
+        self.assertAlmostEqual(
+            float(np.dot(widths[:2], charge.positive_reaction_current_a_m3)),
+            1.0,
+            places=8,
+        )
+        self.assertAlmostEqual(
+            float(np.dot(widths[-2:], charge.negative_reaction_current_a_m3)),
+            -1.0,
+            places=8,
+        )
+        self.assertGreater(charge.cell_voltage_v, discharge.cell_voltage_v)
+        self.assertLess(charge.nonlinear_residual_norm, 1e-7)
+
+    def test_sei_side_reaction_closes_total_negative_current_balance(self):
+        state = self.model.solve(
+            applied_current_a_m2=1.0,
+            electrolyte_concentration_mol_m3=np.full(5, 1000.0),
+            positive_surface_concentration_mol_m3=np.full(2, 0.5 * 51554.0),
+            negative_surface_concentration_mol_m3=np.full(2, 0.5 * 30555.0),
+            temperature_k=298.15,
+            sei_thickness_m=np.full(2, AI2020_SEI_PARAMETERS.initial_thickness_m),
+            sei_parameters=AI2020_SEI_PARAMETERS,
+        )
+        negative_total_reaction = (
+            state.negative_reaction_current_a_m3
+            + state.negative_sei_reaction_current_a_m3
+        )
+
+        self.assertTrue(np.all(state.negative_sei_reaction_current_a_m3 < 0.0))
+        self.assertAlmostEqual(
+            float(np.dot(self.grid.cell_widths_m[-2:], negative_total_reaction)),
+            1.0,
+            places=8,
+        )
+        self.assertLess(state.nonlinear_residual_norm, 1e-7)
+
+    def test_sei_thickness_and_lithium_loss_increase_during_simulation(self):
+        particles = tuple(
+            SphericalParticleDiffusion(
+                radius_m=5e-6,
+                radial_cells=8,
+                diffusivity_m2_s=1.8e-14,
+                activation_energy_j_mol=5000.0,
+                maximum_concentration_mol_m3=51554.0,
+            )
+            for _ in range(2)
+        )
+        negative_particles = tuple(
+            SphericalParticleDiffusion(
+                radius_m=5e-6,
+                radial_cells=8,
+                diffusivity_m2_s=3.9e-14,
+                activation_energy_j_mol=5000.0,
+                maximum_concentration_mol_m3=30555.0,
+            )
+            for _ in range(2)
+        )
+        trajectory = self.model.simulate_constant_current(
+            applied_current_a_m2=1.0,
+            electrolyte_concentration_initial_mol_m3=np.full(5, 1000.0),
+            positive_particle_concentration_initial_mol_m3=np.full(
+                (2, 8), 0.5 * 51554.0
+            ),
+            negative_particle_concentration_initial_mol_m3=np.full(
+                (2, 8), 0.5 * 30555.0
+            ),
+            positive_particles=particles,
+            negative_particles=negative_particles,
+            time_step_s=0.1,
+            maximum_steps=1,
+            sei_parameters=AI2020_SEI_PARAMETERS,
+        )
+
+        self.assertTrue(
+            np.all(
+                trajectory.final_sei_thickness_m
+                > AI2020_SEI_PARAMETERS.initial_thickness_m
+            )
+        )
+        self.assertGreater(trajectory.lithium_loss_to_sei_mol_m2, 0.0)
+
+    def test_voltage_cutoff_time_is_interpolated_within_the_last_step(self):
+        positive_particles = tuple(
+            SphericalParticleDiffusion(
+                radius_m=5e-6,
+                radial_cells=8,
+                diffusivity_m2_s=1.8e-14,
+                activation_energy_j_mol=5000.0,
+                maximum_concentration_mol_m3=51554.0,
+            )
+            for _ in range(2)
+        )
+        negative_particles = tuple(
+            SphericalParticleDiffusion(
+                radius_m=5e-6,
+                radial_cells=8,
+                diffusivity_m2_s=3.9e-14,
+                activation_energy_j_mol=5000.0,
+                maximum_concentration_mol_m3=30555.0,
+            )
+            for _ in range(2)
+        )
+        electrolyte_initial = np.full(5, 1000.0)
+        positive_initial = np.full((2, 8), 0.5 * 51554.0)
+        negative_initial = np.full((2, 8), 0.5 * 30555.0)
+        initial_state = self.solve(1.0)
+        advanced = self.model.advance_species(
+            electrochemical_state=initial_state,
+            electrolyte_concentration_old_mol_m3=electrolyte_initial,
+            positive_particle_concentration_old_mol_m3=positive_initial,
+            negative_particle_concentration_old_mol_m3=negative_initial,
+            positive_particles=positive_particles,
+            negative_particles=negative_particles,
+            time_step_s=0.1,
+        )
+        positive_surface = np.asarray(
+            [
+                particle.surface_concentration_mol_m3(profile)
+                for particle, profile in zip(
+                    positive_particles,
+                    advanced.positive_particle_concentration_mol_m3,
+                )
+            ]
+        )
+        negative_surface = np.asarray(
+            [
+                particle.surface_concentration_mol_m3(profile)
+                for particle, profile in zip(
+                    negative_particles,
+                    advanced.negative_particle_concentration_mol_m3,
+                )
+            ]
+        )
+        next_state = self.model.solve(
+            applied_current_a_m2=1.0,
+            electrolyte_concentration_mol_m3=(
+                advanced.electrolyte_concentration_mol_m3
+            ),
+            positive_surface_concentration_mol_m3=positive_surface,
+            negative_surface_concentration_mol_m3=negative_surface,
+        )
+        cutoff = 0.5 * (initial_state.cell_voltage_v + next_state.cell_voltage_v)
+        trajectory = self.model.simulate_constant_current(
+            applied_current_a_m2=1.0,
+            electrolyte_concentration_initial_mol_m3=electrolyte_initial,
+            positive_particle_concentration_initial_mol_m3=positive_initial,
+            negative_particle_concentration_initial_mol_m3=negative_initial,
+            positive_particles=positive_particles,
+            negative_particles=negative_particles,
+            time_step_s=0.1,
+            maximum_steps=1,
+            cutoff_voltage_v=cutoff,
+        )
+
+        self.assertTrue(trajectory.reached_cutoff)
+        self.assertAlmostEqual(trajectory.voltage_v[-1], cutoff)
+        self.assertGreater(trajectory.time_s[-1], 0.0)
+        self.assertLess(trajectory.time_s[-1], 0.1)
 
     def test_split_species_advance_updates_particles_and_electrolyte(self):
         state = self.solve(1.0)

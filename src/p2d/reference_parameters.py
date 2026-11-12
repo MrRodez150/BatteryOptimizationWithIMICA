@@ -215,6 +215,14 @@ def build_ai2020_reference_model(
     grid: ElectrochemicalGrid1D,
     radial_cells: int = 20,
     data_directory: Path | None = None,
+    *,
+    positive_electrolyte_porosity: float | None = None,
+    separator_electrolyte_porosity: float | None = None,
+    negative_electrolyte_porosity: float | None = None,
+    positive_active_material_volume_fraction: float | None = None,
+    negative_active_material_volume_fraction: float | None = None,
+    positive_particle_radius_m: float | None = None,
+    negative_particle_radius_m: float | None = None,
 ) -> Ai2020ReferenceModel:
     """Build the isothermal Ai2020 reference electrochemical model.
 
@@ -224,12 +232,59 @@ def build_ai2020_reference_model(
     """
     if not isinstance(radial_cells, int) or radial_cells < 2:
         raise ValueError("radial_cells must be an integer >= 2.")
+    positive_porosity = (
+        POSITIVE_ELECTRODE.electrolyte_porosity
+        if positive_electrolyte_porosity is None
+        else positive_electrolyte_porosity
+    )
+    separator_porosity = (
+        SEPARATOR_POROSITY
+        if separator_electrolyte_porosity is None
+        else separator_electrolyte_porosity
+    )
+    negative_porosity = (
+        NEGATIVE_ELECTRODE.electrolyte_porosity
+        if negative_electrolyte_porosity is None
+        else negative_electrolyte_porosity
+    )
+    positive_active_fraction = (
+        POSITIVE_ELECTRODE.active_material_volume_fraction
+        if positive_active_material_volume_fraction is None
+        else positive_active_material_volume_fraction
+    )
+    negative_active_fraction = (
+        NEGATIVE_ELECTRODE.active_material_volume_fraction
+        if negative_active_material_volume_fraction is None
+        else negative_active_material_volume_fraction
+    )
+    positive_radius = (
+        POSITIVE_ELECTRODE.particle_radius_m
+        if positive_particle_radius_m is None
+        else positive_particle_radius_m
+    )
+    negative_radius = (
+        NEGATIVE_ELECTRODE.particle_radius_m
+        if negative_particle_radius_m is None
+        else negative_particle_radius_m
+    )
+    for name, value in (
+        ("positive_active_material_volume_fraction", positive_active_fraction),
+        ("negative_active_material_volume_fraction", negative_active_fraction),
+    ):
+        if not np.isfinite(value) or not 0.0 < value < 1.0:
+            raise ValueError(f"{name} must be finite and in (0, 1).")
+    for name, value in (
+        ("positive_particle_radius_m", positive_radius),
+        ("negative_particle_radius_m", negative_radius),
+    ):
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be positive and finite.")
     lco_ocp, graphite_ocp = load_ai2020_reference_ocps(data_directory)
     porosity = np.concatenate(
         (
-            np.full(grid.positive_cells, POSITIVE_ELECTRODE.electrolyte_porosity),
-            np.full(grid.separator_cells, SEPARATOR_POROSITY),
-            np.full(grid.negative_cells, NEGATIVE_ELECTRODE.electrolyte_porosity),
+            np.full(grid.positive_cells, positive_porosity),
+            np.full(grid.separator_cells, separator_porosity),
+            np.full(grid.negative_cells, negative_porosity),
         )
     )
     bruggeman = np.concatenate(
@@ -270,10 +325,12 @@ def build_ai2020_reference_model(
             grid.negative_cells, NEGATIVE_ELECTRODE.solid_conductivity_s_m
         ),
         positive_interfacial_area_m_inv=np.full(
-            grid.positive_cells, POSITIVE_ELECTRODE.interfacial_area_m_inv
+            grid.positive_cells,
+            3.0 * positive_active_fraction / positive_radius,
         ),
         negative_interfacial_area_m_inv=np.full(
-            grid.negative_cells, NEGATIVE_ELECTRODE.interfacial_area_m_inv
+            grid.negative_cells,
+            3.0 * negative_active_fraction / negative_radius,
         ),
         positive_kinetics=positive_kinetics,
         negative_kinetics=negative_kinetics,
@@ -282,7 +339,7 @@ def build_ai2020_reference_model(
     )
     positive_particles = tuple(
         SphericalParticleDiffusion(
-            radius_m=POSITIVE_ELECTRODE.particle_radius_m,
+            radius_m=positive_radius,
             radial_cells=radial_cells,
             diffusivity_m2_s=POSITIVE_ELECTRODE.particle_diffusivity_m2_s,
             activation_energy_j_mol=(
@@ -297,7 +354,7 @@ def build_ai2020_reference_model(
     )
     negative_particles = tuple(
         SphericalParticleDiffusion(
-            radius_m=NEGATIVE_ELECTRODE.particle_radius_m,
+            radius_m=negative_radius,
             radial_cells=radial_cells,
             diffusivity_m2_s=NEGATIVE_ELECTRODE.particle_diffusivity_m2_s,
             activation_energy_j_mol=(

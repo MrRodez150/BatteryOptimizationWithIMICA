@@ -68,6 +68,9 @@ ELECTROLYTE_MATERIAL = ElectrolyteMaterial(
     conductivity_s_m=0.62,
 )
 
+GRAPHITE_DENSITY_KG_M3 = 2160.0
+GRAPHITE_PRICE_USD_KG = 60.0
+
 CURRENT_COLLECTOR_ALUMINUM = {
     "density_kg_m3": 2700.0,
     "thermal_conductivity_w_mk": 247.0,
